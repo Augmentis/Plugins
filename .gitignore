@@ -1,0 +1,19 @@
+# ── Individual plugin repos (tracked separately) ─────────────────────────────
+Browsky/
+OllamaX/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Node ──────────────────────────────────────────────────────────────────────
+node_modules/
+*.log
+
+# ── Dev loop artifacts (per-plugin) ──────────────────────────────────────────
+dev/.chrome-dev-profile/
+dev/.claude-session-id
+dev/.last-prompt.txt
+
+# ── Secrets / env ─────────────────────────────────────────────────────────────
+.env
+*.pem

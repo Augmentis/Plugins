@@ -1,0 +1,7 @@
+{
+  "cdpPort": 9222,
+  "plugins": [
+    { "path": "../Browsky", "fixer": "claude" },
+    { "path": "../OllamaX", "fixer": "claude" }
+  ]
+}

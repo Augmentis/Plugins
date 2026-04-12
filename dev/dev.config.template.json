@@ -1,0 +1,6 @@
+{
+  "name": "PluginName",
+  "description": "One line description of what this plugin does",
+  "sourceDirs": ["extension", "server"],
+  "fixer": "claude"
+}
