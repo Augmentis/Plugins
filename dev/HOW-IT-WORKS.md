@@ -50,6 +50,28 @@ dev/
 
 ---
 
+## Two ways to trigger the fixer
+
+**Automatically** — any `console.error` or uncaught exception in a loaded
+extension is detected and routed to that plugin's fixer without any action
+from the developer.
+
+**On demand** — open DevTools on any extension page and call the injected
+`fix()` function:
+
+```js
+fix("make the sidebar 20px wider and add a subtle border")
+fix("add keyboard shortcut Cmd+K to focus the search input")
+fix("refactor the polling logic to use exponential backoff")
+```
+
+The orchestrator picks it up, routes it to the plugin's fixer with a
+requirement prompt (instead of an error prompt), applies the change, and
+reloads the extension — same flow as an error fix, same Terminal window,
+same session continuity.
+
+---
+
 ## Step by step
 
 ### 1. `registry.json` — the plugin manifest
@@ -116,28 +138,38 @@ At startup, `error-loop.js` reads `registry.json`, loads each plugin's
 Once this map is built, routing is a single lookup: extract the extension ID
 from the error's source URL, look it up in the map, get the plugin.
 
-### 5. Watching for errors
+### 5. Watching for errors and requests
 
-The orchestrator sends two CDP commands to every extension target:
+The orchestrator sends three CDP commands to every extension target:
 
 - `Runtime.enable` — stream uncaught JavaScript exceptions
-- `Console.enable` — stream `console.error(...)` calls
+- `Console.enable` — stream console API calls
+- `Runtime.evaluate` — inject `window.fix()` into the page
 
-Chrome pushes these events in real time over WebSocket. The moment an error
-fires anywhere in any loaded extension, the orchestrator receives it instantly
-with the message, file name, line number, and column.
+Chrome pushes events in real time over WebSocket. The orchestrator handles
+two types:
+
+**Errors** — any `console.error(...)` call or uncaught exception triggers
+the auto-fix flow.
+
+**Requests** — calling `fix("requirement text")` in the DevTools console
+logs a `[FIX] ...` message that the orchestrator intercepts and routes to
+the plugin's fixer as an implementation request.
 
 ### 6. Routing to the correct fixer
 
-Once the owning plugin is identified, the orchestrator builds a prompt that
-includes:
-
+**For errors**, the orchestrator builds a prompt that includes:
 - The error message and type (exception vs. console.error)
 - The file and line number
 - ~20 lines of source code surrounding the crash site
 - The plugin name, description, and source directories
 
-The prompt is routed to the plugin's configured fixer.
+**For `fix()` requests**, the orchestrator builds a requirement prompt:
+- The exact text passed to `fix()`
+- The plugin name, description, and source directories
+- An instruction to read the relevant files before implementing
+
+Both are routed to the plugin's configured fixer.
 
 ### 7. Fixer: Claude
 
@@ -179,9 +211,15 @@ The same error context and source snippet is included. Ollama does not maintain
 session state, so each fix starts fresh. This is suitable for lightweight fixes
 or for working fully offline.
 
-### 9. Reload + verification
+### 9. Reload after a `fix()` request
 
-After the fixer completes, the orchestrator:
+After the fixer implements a requested change, the orchestrator reloads the
+plugin's extension and re-attaches all watchers. There is no recurrence
+check — the developer can verify the result themselves in the browser.
+
+### 10. Reload + verification after an error fix
+
+After the fixer completes an error fix, the orchestrator:
 
 1. **Reloads the specific extension** — finds the service worker target
    belonging to that plugin's extension ID and calls `chrome.runtime.reload()`
@@ -215,10 +253,11 @@ Every fix edits source files directly. `git diff` shows exactly what changed.
 ```bash
 cat <plugin>/dev/.fix-log.jsonl
 ```
-Each line is a JSON record:
+Each line is a JSON record. Error fixes:
 ```json
 {
   "ts": "2026-04-12T10:15:03.123Z",
+  "type": "error",
   "error": "Cannot read properties of null",
   "location": "extension/sidebar.js:42",
   "source": "Sidebar",
@@ -227,9 +266,20 @@ Each line is a JSON record:
   "verified": true
 }
 ```
-- `isRetry` — `true` if this was a follow-up after a failed first attempt
-- `claudeExitCode` — `0` = success, non-zero = Claude process failed
-- `verified` — `true` if the error did not recur within 12s of reload
+
+`fix()` requests:
+```json
+{
+  "ts": "2026-04-12T10:22:11.456Z",
+  "type": "request",
+  "requirement": "make the sidebar 20px wider",
+  "claudeExitCode": 0
+}
+```
+
+- `isRetry` — `true` if this was a follow-up after a failed error fix attempt
+- `claudeExitCode` — `0` = success, non-zero = fixer process failed
+- `verified` — `true` if the error did not recur within 12s of reload (error fixes only)
 
 ### See the last prompt sent to a plugin's fixer
 ```bash

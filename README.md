@@ -55,6 +55,22 @@ console.error("test error")
 The orchestrator will catch it, print the owning plugin name, open a
 Terminal window, and start a Claude session rooted at that plugin's folder.
 
+### Requesting a change from the console
+
+Every extension page has a `fix()` function injected by the orchestrator.
+Call it from the DevTools console to implement a change directly:
+
+```js
+fix("add a copy button to each response")
+fix("make the host input persist across sessions")
+fix("reduce the poll interval to 3 seconds")
+```
+
+The orchestrator routes the requirement to the plugin's fixer (Claude or
+Ollama), applies the change, and reloads the extension. The same persistent
+Claude session is used, so the fixer has full context from prior fixes and
+requests in the same dev session.
+
 ### Adding a plugin to the dev loop
 
 Edit `dev/registry.json`:

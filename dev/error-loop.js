@@ -122,8 +122,9 @@ function mapFromTargets(targets) {
   }
 }
 
-function getPluginForError(source, location) {
-  const str = location || source || '';
+function getPluginForError(source, location, targetUrl) {
+  // Prefer the target URL — it always contains the full chrome-extension:// origin
+  const str = targetUrl || location || source || '';
   const match = str.match(/chrome-extension:\/\/([a-z]{32})/);
   if (match) return extensionMap.get(match[1]) || null;
   return null;
@@ -213,7 +214,8 @@ function connectTarget(wsUrl) {
 let activeWatchers = [];
 
 async function watchTarget(target) {
-  const label = target.title || target.url || target.id;
+  const label     = target.title || target.url || target.id;
+  const targetUrl = target.url || '';
   step(fmt(c.dim, '● ') + label);
 
   let client;
@@ -229,6 +231,13 @@ async function watchTarget(target) {
   await send('Runtime.enable');
   await send('Console.enable');
 
+  // Inject fix() into the page so developers can type fix("requirement") in
+  // the DevTools console to request a change directly from the browser.
+  await send('Runtime.evaluate', {
+    expression: `window.fix = (req) => { console.log('[FIX] ' + req); return 'Sending to fixer…'; }`,
+    includeCommandLineAPI: false,
+  });
+
   ws.on('cdp_event', (msg) => {
     if (msg.method === 'Runtime.exceptionThrown') {
       const ex = msg.params.exceptionDetails;
@@ -236,13 +245,16 @@ async function watchTarget(target) {
       const loc = ex.url
         ? `${ex.url}:${ex.lineNumber}:${ex.columnNumber}`
         : 'unknown location';
-      handleError({ source: label, text, location: loc, type: 'exception' });
+      handleError({ source: label, targetUrl, text, location: loc, type: 'exception' });
     }
     if (msg.method === 'Console.messageAdded') {
       const m = msg.params.message;
       if (m.level === 'error') {
         const loc = m.url ? `${m.url}:${m.line}:${m.column}` : 'unknown location';
-        handleError({ source: label, text: m.text, location: loc, type: 'console.error' });
+        handleError({ source: label, targetUrl, text: m.text, location: loc, type: 'console.error' });
+      } else if (m.level === 'log' && m.text?.startsWith('[FIX] ')) {
+        const requirement = m.text.slice('[FIX] '.length).trim();
+        if (requirement) handleRequest({ source: label, targetUrl, requirement });
       }
     }
   });
@@ -272,7 +284,7 @@ function handleError(err) {
   seenErrors.add(key);
   setTimeout(() => seenErrors.delete(key), 10_000);
 
-  const plugin = getPluginForError(err.source, err.location);
+  const plugin = getPluginForError(err.source, err.location, err.targetUrl);
   const pluginLabel = plugin
     ? fmt(c.cyan, plugin.name)
     : fmt(c.yellow, 'unknown plugin');
@@ -303,6 +315,37 @@ function handleError(err) {
   );
 
   errorQueue = errorQueue.then(() => runFix(err, plugin));
+}
+
+// ── Request handler (fix() console command) ───────────────────────────────────
+
+function handleRequest(req) {
+  const plugin = getPluginForError(req.source, req.targetUrl, req.targetUrl);
+  const pluginLabel = plugin
+    ? fmt(c.cyan, plugin.name)
+    : fmt(c.yellow, 'unknown plugin');
+
+  console.log('\n' + line());
+  console.log(fmt(c.blue, c.bold + '  ◈ REQUEST') + '  ' + pluginLabel);
+  console.log(fmt(c.dim, '  > ') + req.requirement);
+  console.log(line());
+
+  if (!plugin) {
+    console.log(fmt(c.yellow, '  ⚠ No registered plugin owns this extension — skipping.'));
+    console.log(fmt(c.dim,    '    Add it to dev/registry.json to enable fix() requests.\n'));
+    return;
+  }
+
+  const fixerLabel = plugin.fixer === 'claude'
+    ? 'Claude'
+    : plugin.fixer.startsWith('ollama:') ? plugin.fixer : plugin.fixer;
+
+  console.log(
+    fmt(c.blue, `  → Routing to ${fixerLabel} for ${plugin.name}…`) +
+    fmt(c.dim, ' (new Terminal window opening)\n')
+  );
+
+  errorQueue = errorQueue.then(() => runRequest(req, plugin));
 }
 
 // ── Source context ────────────────────────────────────────────────────────────
@@ -641,6 +684,144 @@ function runFix(err, plugin, isRetry = false) {
   if (plugin.fixer?.startsWith('ollama:')) {
     const model = plugin.fixer.slice('ollama:'.length);
     return runOllamaFix(err, plugin, model, isRetry);
+  }
+
+  console.warn(`  ⚠ Unknown fixer "${plugin.fixer}" for ${plugin.name} — skipping`);
+  return Promise.resolve();
+}
+
+// ── Request runner (fix() console command) ────────────────────────────────────
+
+function buildRequestPrompt(req, plugin) {
+  const sessionId = loadSessionId(plugin);
+
+  const freshHeader = !sessionId
+    ? `Before doing anything else, read ${path.join(plugin.dir, 'CLAUDE.md')} ` +
+      `to understand the project structure and conventions.\n\n`
+    : '';
+
+  return (
+    `${freshHeader}` +
+    `The developer has requested a change to the ${plugin.name} Chrome extension.\n\n` +
+    `Project: ${plugin.description}\n` +
+    `Request: ${req.requirement}\n\n` +
+    `Project root: ${plugin.dir}\n` +
+    `Source directories: ${(plugin.sourceDirs || []).join(', ')}\n\n` +
+    `Please:\n` +
+    `1. Read the relevant source files to understand the current implementation\n` +
+    `2. Implement the requested change\n` +
+    `3. Briefly explain what you changed\n\n` +
+    `Apply the change directly — do not just suggest it.`
+  );
+}
+
+async function reloadAfterRequest(plugin) {
+  const reloaded = await reloadExtension(plugin);
+  if (reloaded) {
+    await reAttachWatchers();
+    console.log(fmt(c.green, '  ✓ Extension reloaded with changes.\n'));
+  }
+}
+
+function runClaudeRequest(req, plugin) {
+  return new Promise((resolve) => {
+    const sessionId = loadSessionId(plugin);
+    const prompt = buildRequestPrompt(req, plugin);
+
+    fs.mkdirSync(plugin.devDir, { recursive: true });
+    fs.writeFileSync(plugin.lastPromptFile, prompt, 'utf8');
+
+    const args = [
+      '-p', '--output-format', 'stream-json', '--verbose',
+      '--allowedTools', 'Read,Edit,Write',
+    ];
+    if (sessionId) args.push('--resume', sessionId);
+    args.push(prompt);
+
+    const claudeCmd = [
+      'claude',
+      ...args.map((a) => `'${a.replace(/'/g, "'\\''")}'`),
+    ].join(' ');
+
+    const termScript = `
+      tell application "Terminal"
+        activate
+        do script "cd '${plugin.dir}' && echo 'Implementing: ${req.requirement.replace(/'/g, "\\'")}' && ${claudeCmd}; echo; echo '[Done — window will stay open]'"
+      end tell
+    `;
+
+    const proc = spawn('claude', args, {
+      cwd: plugin.dir,
+      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let buffer = '';
+    proc.stdout.on('data', (data) => {
+      buffer += data.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const rawLine of lines) {
+        if (!rawLine.trim()) continue;
+        try {
+          const obj = JSON.parse(rawLine);
+          if (obj.type === 'result' && obj.session_id) saveSessionId(plugin, obj.session_id);
+        } catch {}
+      }
+    });
+
+    proc.on('close', async (code) => {
+      if (code !== 0) step(fmt(c.red, `✗ claude exited with code ${code}`));
+      appendFixLog(plugin, {
+        type: 'request', requirement: req.requirement, claudeExitCode: code,
+      });
+      step(fmt(c.green, '✓ Change applied'));
+      await reloadAfterRequest(plugin);
+      resolve();
+    });
+
+    exec(
+      `osascript -e "${termScript.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`,
+      (e) => { if (e) console.warn('Could not open Terminal window:', e.message); }
+    );
+  });
+}
+
+function runOllamaRequest(req, plugin, model) {
+  return new Promise((resolve) => {
+    const prompt = buildRequestPrompt(req, plugin);
+
+    fs.mkdirSync(plugin.devDir, { recursive: true });
+    fs.writeFileSync(plugin.lastPromptFile, prompt, 'utf8');
+
+    step(fmt(c.blue, `Running ollama ${model} for ${plugin.name}…`));
+
+    const proc = spawn('ollama', ['run', model, prompt], {
+      cwd: plugin.dir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    proc.stdout.on('data', (d) => process.stdout.write(d));
+    proc.stderr.on('data', (d) => process.stderr.write(d));
+
+    proc.on('close', async (code) => {
+      appendFixLog(plugin, {
+        type: 'request', requirement: req.requirement,
+        fixer: `ollama:${model}`, exitCode: code,
+      });
+      step(fmt(c.green, '✓ Ollama response received'));
+      await reloadAfterRequest(plugin);
+      resolve();
+    });
+  });
+}
+
+function runRequest(req, plugin) {
+  if (plugin.fixer === 'claude') return runClaudeRequest(req, plugin);
+
+  if (plugin.fixer?.startsWith('ollama:')) {
+    const model = plugin.fixer.slice('ollama:'.length);
+    return runOllamaRequest(req, plugin, model);
   }
 
   console.warn(`  ⚠ Unknown fixer "${plugin.fixer}" for ${plugin.name} — skipping`);
